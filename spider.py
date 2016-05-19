@@ -13,7 +13,7 @@ import requests
 from urllib import parse
 
 from plugin import *
-from buffer import UrlCache, UrlData
+from buffer import UrlData,BloomFilter
 from utils import HtmlAnalyzer, WebKit,allow_url
 
 
@@ -25,8 +25,7 @@ class Fetcher(Greenlet):
         self.fetcher_id = str(uuid.uuid1())[:8]
         self.TOO_LONG = 1048576  # 1M
         self.spider = spider
-        self.fetcher_cache = self.spider.fetcher_cache
-        self.crawler_cache = self.spider.crawler_cache
+        self.fetcher_bf = self.spider.fetcher_bf
         self.fetcher_queue = self.spider.fetcher_queue
         self.crawler_queue = self.spider.crawler_queue
         self.plugin_handler=self.spider.plugin_handler
@@ -47,26 +46,24 @@ class Fetcher(Greenlet):
             else:
                 if not url_data.html:
                     try:
-                        if url_data not in self.crawler_cache:
-                            html = ''
-                            with gevent.Timeout(self.spider.internal_timeout, False) as timeout:
-                                html = self._open(url_data)
-                            if not html.strip():
-                                self.spider.fetcher_queue.task_done()
-                                continue
-                            self.logger.info('fetcher %s accept %s' % (self.fetcher_id, url_data))
-                            url_data.html = html
-                            for plugin_name in self.plugin_handler:  # 循环动态调用初始化时注册的插件
-                                try:
-                                    plugin_obj = eval(plugin_name)()
-                                    plugin_obj.start(url_data)
-                                except Exception as e:
-                                    import traceback
-                                    traceback.print_exc()
+                        html = ''
+                        with gevent.Timeout(self.spider.internal_timeout, False) as timeout:
+                            html = self._open(url_data)
+                        if not html.strip():
+                            self.spider.fetcher_queue.task_done()
+                            continue
+                        self.logger.info('fetcher %s accept %s' % (self.fetcher_id, url_data))
+                        url_data.html = html
+                        for plugin_name in self.plugin_handler:  # 循环动态调用初始化时注册的插件
+                            try:
+                                plugin_obj = eval(plugin_name)()
+                                plugin_obj.start(url_data)
+                            except Exception as e:
+                                import traceback
+                                traceback.print_exc()
 
-                            if not self.spider.crawler_stopped.isSet():
-                                self.crawler_queue.put(url_data, block=True)
-                            self.crawler_cache.insert(url_data)
+                        if not self.spider.crawler_stopped.isSet():
+                            self.crawler_queue.put(url_data, block=True)
 
                     except Exception as e:
                         import traceback
@@ -109,7 +106,7 @@ class Spider(object):
     """爬虫主类"""
     logger = logging.getLogger("spider")
 
-    def __init__(self, concurrent_num=20, crawl_tags=[], custom_headers={}, plugin=['SavePage'], depth=3,
+    def __init__(self, concurrent_num=20, crawl_tags=[], custom_headers={}, plugin=[], depth=3,
                  max_url_num=300, internal_timeout=60, spider_timeout=6 * 3600,
                  crawler_mode=0, same_origin=True, dynamic_parse=False):
         '''
@@ -148,8 +145,7 @@ class Spider(object):
         self.fetcher_queue = threadpool.Queue(maxsize=self.concurrent_num * 10000)
         self.crawler_queue = threadpool.Queue(maxsize=self.concurrent_num * 10000)
 
-        self.fetcher_cache = UrlCache()
-        self.crawler_cache = UrlCache()
+        self.fetcher_bf=BloomFilter(0.0001,1000000)
 
         self.default_crawl_tags = ['a', 'base', 'iframe', 'frame', 'object']
         self.ignore_ext = ['js', 'css', 'png', 'jpg', 'gif', 'bmp', 'svg', 'exif', 'jpeg', 'exe', 'rar', 'zip', 'pdf']
@@ -157,6 +153,7 @@ class Spider(object):
         self.same_origin = same_origin
         self.depth = depth
         self.max_url_num = max_url_num
+        self.fetched_url=0
         self.dynamic_parse = dynamic_parse
         if self.dynamic_parse:
             self.webkit = WebKit()
@@ -203,7 +200,7 @@ class Spider(object):
         self.stopped.clear()
         # if self.dynamic_parse:
         #     self.webkit.close()
-        self.logger.info("crawler_cache:%s fetcher_cache:%s" % (len(self.crawler_cache), len(self.fetcher_cache)))
+        self.logger.info("Fetched %s urls" % self.fetched_url)
         self.logger.info("spider process quit.")
 
     def crawler(self, _dep=None):
@@ -235,21 +232,22 @@ class Spider(object):
                         else:
                             self.crawler_stopped.set()
                             break
-                    if len(self.fetcher_cache) == self.max_url_num:
+                    if self.fetched_url == self.max_url_num:
                         if self.crawler_stopped.isSet():
                             break
                         else:
                             self.crawler_stopped.set()
                             break
                     url = UrlData(link, depth=curr_depth)
-                    self.fetcher_cache.insert(url)
+                    self.fetcher_bf.insert_element(str(url))
+                    self.fetched_url+=1
                     self.fetcher_queue.put(url, block=True)
 
                 self.crawler_queue.task_done()
 
     def check_url_usable(self, link):
         '''检查链接是否可以'''
-        if link in self.fetcher_cache:
+        if self.fetcher_bf.is_element_exist(link):
             return False
 
         if not link.startswith('http'):
@@ -314,7 +312,7 @@ class Spider(object):
 
 
 if __name__ == '__main__':
-    spider = Spider(concurrent_num=10, depth=5, max_url_num=10000, crawler_mode=1, dynamic_parse=False)
+    spider = Spider(concurrent_num=10, depth=5, max_url_num=1000, crawler_mode=1, dynamic_parse=False)
     bk_list=['beicai', 'caolu', 'chuansha', 'hangtou', 'huamu', 'huinan', 'jinqiao', 'kangqiao', 'lianyang', 'lingangxincheng', 'liuli', 'lujiazui', 'pudongwaihuan', 'sanlin', 'shangnan', 'shibobinjianga', 'tangzhen', 'tangqiao', 'waigaoqiao', 'yangjing', 'zhangjiang', 'zhoupu', 'chunshen', 'gumeiluoyang', 'hanghua', 'jinhongqiao', 'longbojinhui', 'meilong', 'pujiang', 'qibao', 'xinzhuang', 'wujing', 'zhuanqiao', 'huajing', 'huaihaixilu', 'kangjian', 'longhua', 'shanghainanzhan', 'tianlin', 'wantiguan', 'xujiahui', 'changqiao', 'caoyang', 'ganquanyichuan', 'guangxin', 'taopu', 'wanli', 'wuning', 'changshoulu', 'zhenru', 'beixinjing', 'dongwuyuan', 'gubei', 'hongqiaolu', 'tianshan', 'xianxia', 'xinhualu', 'zhongshangongyuan', 'caojiadu', 'jiangninglu', 'jingansi', 'nanjingxilu', 'huangpubinjiang', 'laoximen', 'nanjingdonglu', 'penglaigongyuan', 'renminguangchang', 'yuyuan', 'dapuqiao', 'fuxinggongyuan', 'huaihaizhonglu', 'shibobinjiang', 'wuliqiao', 'xintiandi', 'beiwaitan', 'jiangwanzhen', 'liangvhen', 'linpinglu', 'luxungongyuan', 'quyang', 'sichuanbeilu', 'daninglvdi', 'pengpu', 'xizangbeilu', 'xinkezhan', 'zhabeigongyuan', 'anshan', 'dongwaitan', 'huangxinggongyuan', 'kongjianglu', 'wujiaochang', 'xinjiangwancheng', 'zhongyuanshequ', 'dachang', 'dahua', 'gongfu', 'gucun', 'luodian', 'shangda', 'songnan', 'tonghe', 'jiuting', 'sheshan', 'xinmin', 'sijing', 'songjiangchengqu', 'songjiangdaxuecheng', 'xiaokunshan', 'xinqiao', 'anting', 'fengzhuang', 'jiadingchengqu', 'jiangqiaoxincheng', 'nanxiang', 'huaxin', 'qingpuxincheng', 'xujing', 'zhaoxiang', 'zhonggu', 'zhujiajiao', 'fengcheng', 'haiwan', 'nanqiao', 'fengjing', 'jinshanxincheng', 'tinglin', 'zhujing', 'baozhen', 'chenjiazhen', 'changxingdao']
     for bk in bk_list:
         url='http://shanghai.anjuke.com/sale/'+bk+'/p1/#filtersort'
